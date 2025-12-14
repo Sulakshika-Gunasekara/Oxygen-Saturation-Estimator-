@@ -1,185 +1,322 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <title>SpO₂ Demo From Face Video (rPPG + ONNX)</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SpO2 Mobile App</title>
+    <link rel="stylesheet" href="style.css">
     <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+</head>
+<body>
 
-    <style>
-      body {
-        font-family: system-ui;
-        background: #0f172a;
-        color: #e5e7eb;
-        margin: 0;
-        padding: 20px;
-        display: flex;
-        justify-content: center;
-      }
-      .card {
-        max-width: 520px;
-        width: 100%;
-        background: #020617;
-        padding: 20px;
-        border-radius: 16px;
-        border: 1px solid #1f2937;
-        box-shadow: 0 10px 40px rgba(15, 23, 42, 0.7);
-      }
-      video {
-        width: 100%;
-        border-radius: 12px;
-        background: black;
-        margin-top: 12px;
-      }
-      button,
-      input {
-        width: 100%;
-        padding: 12px;
-        border-radius: 999px;
-        margin-top: 12px;
-        border: none;
-        font-size: 1rem;
-      }
-      button {
-        cursor: pointer;
-        background: linear-gradient(135deg, #22c55e, #14b8a6);
-        color: #020617;
-        font-weight: 700;
-      }
-      button:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-      #spo2Value {
-        font-size: 1.4rem;
-        font-weight: 800;
-      }
-      #status {
-        white-space: pre-wrap;
-      }
-    </style>
-  </head>
+<div class="mobile-wrapper">
 
-  <body>
-    <div class="card">
-      <h2>SpO₂ From Face Video (Demo – Non Medical)</h2>
-      <div id="status">Loading model…</div>
-
-      <input type="file" id="videoInput" accept="video/*" />
-      <video id="video" controls></video>
-      <canvas id="canvas" style="display: none"></canvas>
-
-      <button id="analyzeBtn" disabled>Analyze Video</button>
-
-      <p>Predicted SpO₂: <span id="spo2Value">–</span></p>
-      <p style="font-size: 0.8rem; color: #9ca3af">
-        Uses rPPG from forehead area. For demonstration only.
-      </p>
+    <!-- Landing Page -->
+    <div id="landing-page" class="screen active">
+        <div class="logo-placeholder">❤️</div>
+        <h1>PulseCheck</h1>
+        <p>Measure your SpO₂ levels using just your smartphone camera.</p>
+        <button class="btn" onclick="showScreen('home-page')">Get Started</button>
     </div>
 
-    <script>
-      let session = null;
-      let featMean = null,
-        featStd = null;
-      let SEQ_LEN = 200;
-      let N_FEATS = 17;
+    <!-- Home Page -->
+    <div id="home-page" class="screen">
+        <h1>New Measurement</h1>
+        <p>Upload a video of your face to begin the analysis.</p>
 
-      const statusEl = document.getElementById("status");
-      const videoEl = document.getElementById("video");
-      const canvasEl = document.getElementById("canvas");
-      const ctx = canvasEl.getContext("2d");
-      const analyzeBtn = document.getElementById("analyzeBtn");
+        <div class="upload-container" onclick="document.getElementById('videoInput').click()">
+            <span style="font-size: 40px;">📹</span>
+            <p>Tap to Select Video</p>
+            <input type="file" id="videoInput" accept="video/*">
+        </div>
 
-      function setStatus(msg) {
-        statusEl.textContent = msg;
-      }
+        <p style="font-size: 12px; color: #999;">Ensure your face is well-lit and stable.</p>
+    </div>
 
-      // ---------------- LOAD MODEL + NORM ----------------
-      async function loadAll() {
+    <!-- Processing Page -->
+    <div id="processing-page" class="screen">
+        <h1>Processing</h1>
+        <video id="video-preview" playsinline muted></video> <!-- Hidden video element for processing but we might show it -->
+
+        <div class="waveform-container">
+            <canvas id="waveform-canvas"></canvas>
+        </div>
+        <p class="progress-info" id="status-text">Initializing...</p>
+
+        <!-- Hidden canvas for pixel extraction -->
+        <canvas id="process-canvas" style="display: none;"></canvas>
+    </div>
+
+    <!-- Result Page -->
+    <div id="result-page" class="screen">
+        <h1>Result</h1>
+        <div class="result-circle">
+            <span class="spo2-value" id="spo2-display">--%</span>
+            <span class="spo2-label">SpO₂</span>
+        </div>
+        <p>Measurement Complete</p>
+        <button class="btn" onclick="resetApp()">Measure Again</button>
+    </div>
+
+</div>
+
+<script>
+    // --- Global State ---
+    let session = null;
+    let featMean = null, featStd = null;
+    let SEQ_LEN = 200;
+    let N_FEATS = 17;
+
+    // UI Elements
+    const videoEl = document.getElementById('video-preview');
+    const processCanvas = document.getElementById('process-canvas');
+    const processCtx = processCanvas.getContext('2d', { willReadFrequently: true });
+    const waveformCanvas = document.getElementById('waveform-canvas');
+    const waveCtx = waveformCanvas.getContext('2d');
+    const statusText = document.getElementById('status-text');
+    const spo2Display = document.getElementById('spo2-display');
+
+    // --- Navigation ---
+    function showScreen(screenId) {
+        document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+        document.getElementById(screenId).classList.add('active');
+    }
+
+    function resetApp() {
+        videoEl.pause();
+        videoEl.src = "";
+        spo2Display.textContent = "--%";
+        showScreen('landing-page');
+        // Clear waveform
+        waveCtx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+    }
+
+    // --- Initialization ---
+    async function initModel() {
         try {
-          setStatus("Loading norm.json…");
-          const normRes = await fetch("norm.json");
-          const norm = await normRes.json();
+            console.log("Loading norm.json...");
+            const normRes = await fetch("norm.json");
+            const norm = await normRes.json();
 
-          featMean = norm.feat_mean;
-          featStd = norm.feat_std;
-          SEQ_LEN = norm.max_t ?? 200;
-          N_FEATS = norm.n_feats ?? featMean.length;
+            featMean = norm.feat_mean;
+            featStd = norm.feat_std;
+            SEQ_LEN = norm.max_t ?? 200;
+            N_FEATS = norm.n_feats ?? featMean.length;
 
-          setStatus(
-            `Loading model.onnx…\n(max_t=${SEQ_LEN}, n_feats=${N_FEATS})`
-          );
-          session = await ort.InferenceSession.create("model.onnx");
-
-          setStatus("Ready. Upload a face video.");
+            console.log(`Loading model.onnx (max_t=${SEQ_LEN}, n_feats=${N_FEATS})...`);
+            session = await ort.InferenceSession.create("model.onnx");
+            console.log("Model loaded.");
         } catch (e) {
-          console.error(e);
-          setStatus("ERROR loading model/norm:\n" + (e?.message ?? e));
+            console.error("Error loading model:", e);
+            alert("Failed to load model resources. Check console.");
         }
-      }
-      loadAll();
+    }
+    initModel();
 
-      // -------------- VIDEO UPLOAD ----------------
-      document
-        .getElementById("videoInput")
-        .addEventListener("change", async (e) => {
-          const file = e.target.files[0];
-          if (!file) return;
+    // --- File Handling ---
+    document.getElementById('videoInput').addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
 
-          analyzeBtn.disabled = true;
-          videoEl.src = URL.createObjectURL(file);
+        // Reset inputs
+        e.target.value = null;
 
-          // wait for metadata so duration is valid
-          await new Promise((resolve) => {
+        showScreen('processing-page');
+        statusText.textContent = "Loading video...";
+
+        const url = URL.createObjectURL(file);
+        videoEl.src = url;
+
+        await new Promise((resolve) => {
             videoEl.onloadedmetadata = () => resolve();
-          });
-
-          setStatus(
-            `Video loaded (${videoEl.duration.toFixed(2)}s). Press Analyze.`
-          );
-          analyzeBtn.disabled = false;
         });
 
-      // ---------------- rPPG helpers ----------------
-      function extractGreenSignal(frames) {
-        const signal = [];
-        for (const imgData of frames) {
-          const data = imgData.data;
-          let gSum = 0,
-            count = 0;
-          for (let i = 0; i < data.length; i += 4) {
-            gSum += data[i + 1];
-            count++;
-          }
-          signal.push(gSum / Math.max(count, 1));
-        }
-        return signal;
-      }
+        statusText.textContent = "Analyzing...";
+        startAnalysis();
+    });
 
-      function bandpass(signal) {
+    // --- Waveform Visualization ---
+    let signalBuffer = [];
+    function updateWaveform(newValue) {
+        signalBuffer.push(newValue);
+        if (signalBuffer.length > 100) signalBuffer.shift(); // Keep last 100 points
+
+        const width = waveformCanvas.width;
+        const height = waveformCanvas.height;
+        waveCtx.clearRect(0, 0, width, height);
+
+        if (signalBuffer.length < 2) return;
+
+        // Normalize for display
+        const min = Math.min(...signalBuffer);
+        const max = Math.max(...signalBuffer);
+        const range = max - min || 1;
+
+        waveCtx.beginPath();
+        waveCtx.strokeStyle = '#e74c3c'; // Red line
+        waveCtx.lineWidth = 2;
+
+        for (let i = 0; i < signalBuffer.length; i++) {
+            const x = (i / (100 - 1)) * width; // fit 100 points
+            const normalizedY = (signalBuffer[i] - min) / range;
+            const y = height - (normalizedY * height * 0.8 + height * 0.1); // 10% padding
+
+            if (i === 0) waveCtx.moveTo(x, y);
+            else waveCtx.lineTo(x, y);
+        }
+        waveCtx.stroke();
+    }
+
+    // --- Analysis Pipeline ---
+    async function seekTo(t) {
+        return new Promise((resolve) => {
+            const onSeek = () => {
+                videoEl.onseeked = null;
+                resolve();
+            };
+            videoEl.onseeked = onSeek;
+            videoEl.currentTime = t;
+            // Fallback
+            setTimeout(() => {
+                if (videoEl.seeking) resolve();
+            }, 500);
+        });
+    }
+
+    async function startAnalysis() {
+        if (!session || !featMean) {
+            alert("Model not ready yet. Please wait a moment.");
+            showScreen('home-page');
+            return;
+        }
+
+        try {
+            const frames = [];
+            const duration = videoEl.duration;
+
+            // Set canvas size for extraction
+            processCanvas.width = 200;
+            processCanvas.height = 200;
+
+            // Handle waveform canvas responsive size
+            const rect = waveformCanvas.parentElement.getBoundingClientRect();
+            waveformCanvas.width = rect.width;
+            waveformCanvas.height = rect.height;
+            signalBuffer = [];
+
+            // Frame extraction loop
+            for (let i = 0; i < SEQ_LEN; i++) {
+                const t = (i / SEQ_LEN) * duration;
+                await seekTo(t);
+
+                // Draw frame to hidden canvas
+                processCtx.drawImage(videoEl, 0, 0, 200, 200);
+
+                // Extract ROI (forehead approx) - same as original: 50, 20, 100, 100
+                const imgData = processCtx.getImageData(50, 20, 100, 100);
+                frames.push(imgData);
+
+                // Visualization: Calculate mean green of this frame immediately
+                const gMean = calculateGreenMean(imgData);
+                updateWaveform(gMean);
+
+                // Update progress text
+                statusText.textContent = `Scanning frame ${i+1}/${SEQ_LEN}`;
+
+                // Allow UI to update
+                await new Promise(r => requestAnimationFrame(r));
+            }
+
+            statusText.textContent = "Computing SpO₂...";
+
+            // Give UI a moment to show text
+            await new Promise(r => setTimeout(r, 100));
+
+            // Full Processing
+            const green = extractGreenSignal(frames);
+            const bp = bandpass(green);
+            const fft = fftMag(bp);
+
+            const features = [];
+            for (let i = 0; i < SEQ_LEN; i++) {
+                features.push(
+                    generate17Features(bp.slice(Math.max(0, i - 20), i + 1), fft)
+                );
+            }
+
+            // Normalization
+            const flat = new Float32Array(SEQ_LEN * N_FEATS);
+            let k = 0;
+            for (let t = 0; t < SEQ_LEN; t++) {
+                for (let f = 0; f < N_FEATS; f++) {
+                    const x = features[t][f] ?? 0;
+                    const mu = featMean[f] ?? 0;
+                    const sd = featStd[f] ?? 1;
+                    const safeSd = Math.abs(sd) < 1e-9 ? 1.0 : sd;
+                    flat[k++] = (x - mu) / safeSd;
+                }
+            }
+
+            // Inference
+            const inputTensor = new ort.Tensor("float32", flat, [1, SEQ_LEN, N_FEATS]);
+            const maskTensor = new ort.Tensor("bool", new Uint8Array(SEQ_LEN), [1, SEQ_LEN]);
+
+            const out = await session.run({
+                input: inputTensor,
+                mask: maskTensor,
+            });
+            const spo2 = out.output.data[0];
+
+            // Show Result
+            spo2Display.textContent = spo2.toFixed(1) + "%";
+            showScreen('result-page');
+
+        } catch (e) {
+            console.error(e);
+            alert("Error analyzing video: " + e.message);
+            showScreen('home-page');
+        }
+    }
+
+    // --- Math Helpers ---
+    function calculateGreenMean(imgData) {
+        const data = imgData.data;
+        let sum = 0;
+        let count = 0;
+        for (let i = 0; i < data.length; i += 4) {
+            sum += data[i + 1]; // Green channel
+            count++;
+        }
+        return sum / Math.max(count, 1);
+    }
+
+    function extractGreenSignal(frames) {
+        return frames.map(calculateGreenMean);
+    }
+
+    function bandpass(signal) {
         const out = [];
         for (let i = 1; i < signal.length - 1; i++) {
-          out.push(signal[i] - (signal[i - 1] + signal[i + 1]) / 2);
+            out.push(signal[i] - (signal[i - 1] + signal[i + 1]) / 2);
         }
         return out.length ? out : [0];
-      }
+    }
 
-      // very slow O(N^2) FFT but fine for N~200
-      function fftMag(signal) {
+    function fftMag(signal) {
         const N = signal.length;
         const re = new Array(N).fill(0);
         const im = new Array(N).fill(0);
         for (let k = 0; k < N; k++) {
-          for (let n = 0; n < N; n++) {
-            const ang = (2 * Math.PI * k * n) / N;
-            re[k] += signal[n] * Math.cos(ang);
-            im[k] -= signal[n] * Math.sin(ang);
-          }
+            for (let n = 0; n < N; n++) {
+                const ang = (2 * Math.PI * k * n) / N;
+                re[k] += signal[n] * Math.cos(ang);
+                im[k] -= signal[n] * Math.sin(ang);
+            }
         }
         return re.map((r, i) => Math.sqrt(r * r + im[i] * im[i]));
-      }
+    }
 
-      function generate17Features(ppg, fft) {
+    function generate17Features(ppg, fft) {
         const L = ppg.length || 1;
         const mean = ppg.reduce((a, b) => a + b, 0) / L;
         const std = Math.sqrt(
@@ -218,114 +355,8 @@
           maxP - minP,
           std === 0 ? 0 : mean / std,
         ];
-      }
+    }
+</script>
 
-      // ---------------- MAIN PIPELINE ----------------
-      async function seekTo(t) {
-        return new Promise((resolve, reject) => {
-          const onSeek = () => {
-            videoEl.onseeked = null;
-            resolve();
-          };
-          videoEl.onseeked = onSeek;
-          // some browsers need slight clamp
-          videoEl.currentTime = Math.min(
-            Math.max(t, 0),
-            Math.max(videoEl.duration - 0.001, 0)
-          );
-          // fallback timeout
-          setTimeout(() => resolve(), 1500);
-        });
-      }
-
-      analyzeBtn.addEventListener("click", async () => {
-        if (!session || !featMean || !featStd) {
-          setStatus("Model not ready yet.");
-          return;
-        }
-
-        analyzeBtn.disabled = true;
-        document.getElementById("spo2Value").textContent = "–";
-
-        try {
-          setStatus("Extracting frames…");
-
-          canvasEl.width = 200;
-          canvasEl.height = 200;
-
-          const frames = [];
-          const duration = videoEl.duration;
-          if (!isFinite(duration) || duration <= 0) {
-            throw new Error(
-              "Video duration is not valid. Try pressing Play once, then Analyze again."
-            );
-          }
-
-          for (let i = 0; i < SEQ_LEN; i++) {
-            const t = (i / SEQ_LEN) * duration;
-            await seekTo(t);
-
-            ctx.drawImage(videoEl, 0, 0, 200, 200);
-            const imgData = ctx.getImageData(50, 20, 100, 100);
-            frames.push(imgData);
-          }
-
-          setStatus("Computing rPPG…");
-          const green = extractGreenSignal(frames);
-          const bp = bandpass(green);
-          const fft = fftMag(bp);
-
-          const features = [];
-          for (let i = 0; i < SEQ_LEN; i++) {
-            features.push(
-              generate17Features(bp.slice(Math.max(0, i - 20), i + 1), fft)
-            );
-          }
-
-          // normalize + flatten (use N_FEATS from norm.json)
-          const flat = new Float32Array(SEQ_LEN * N_FEATS);
-          let k = 0;
-          for (let t = 0; t < SEQ_LEN; t++) {
-            for (let f = 0; f < N_FEATS; f++) {
-              const x = features[t][f] ?? 0;
-              const mu = featMean[f] ?? 0;
-              const sd = featStd[f] ?? 1;
-              const safeSd = Math.abs(sd) < 1e-9 ? 1.0 : sd;
-              flat[k++] = (x - mu) / safeSd;
-            }
-          }
-
-          setStatus("Running ONNX model…");
-          const inputTensor = new ort.Tensor("float32", flat, [
-            1,
-            SEQ_LEN,
-            N_FEATS,
-          ]);
-          const maskTensor = new ort.Tensor("bool", new Uint8Array(SEQ_LEN), [
-            1,
-            SEQ_LEN,
-          ]);
-
-          const out = await session.run({
-            input: inputTensor,
-            mask: maskTensor,
-          });
-          const spo2 = out.output.data[0];
-
-          document.getElementById("spo2Value").textContent =
-            spo2.toFixed(1) + "%";
-          setStatus("Done!");
-        } catch (e) {
-          console.error(e);
-          setStatus(
-            "ERROR during analysis:\n" +
-              (e?.message ?? e) +
-              "\n\nOpen DevTools → Console for details."
-          );
-        } finally {
-          analyzeBtn.disabled = false;
-        }
-      });
-    </script>
-  </body>
+</body>
 </html>
