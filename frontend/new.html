@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SpO₂ Demo from Face Video (Tiny Transformer)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        margin: 0;
+        padding: 16px;
+        background: #020617;
+        color: #e5e7eb;
+        display: flex;
+        justify-content: center;
+      }
+      .card {
+        max-width: 520px;
+        width: 100%;
+        background: #020617;
+        border-radius: 16px;
+        padding: 20px;
+        box-shadow: 0 10px 40px rgba(15, 23, 42, 0.8);
+        border: 1px solid #1f2937;
+      }
+      h1 {
+        margin-top: 0;
+        text-align: center;
+        font-size: 1.3rem;
+      }
+      .status {
+        font-size: 0.85rem;
+        color: #9ca3af;
+        margin-bottom: 10px;
+        min-height: 1.2em;
+      }
+      video {
+        width: 100%;
+        border-radius: 12px;
+        background: #000;
+        margin-top: 10px;
+      }
+      input[type="file"],
+      button {
+        width: 100%;
+        padding: 10px 14px;
+        margin-top: 10px;
+        border-radius: 999px;
+        border: none;
+        font-size: 0.95rem;
+      }
+      input[type="file"] {
+        background: #020617;
+        color: #e5e7eb;
+        border: 1px solid #374151;
+      }
+      button {
+        font-weight: 600;
+        background: linear-gradient(135deg, #22c55e, #14b8a6);
+        color: #020617;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      .output {
+        margin-top: 14px;
+        font-size: 1.1rem;
+        text-align: center;
+      }
+      .small {
+        font-size: 0.8rem;
+        color: #9ca3af;
+        margin-top: 6px;
+        text-align: center;
+      }
+      canvas {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>SpO₂ from Face Video (Demo – Not Medical)</h1>
+      <div id="status" class="status">Loading model…</div>
+
+      <input type="file" id="videoInput" accept="video/*" />
+      <video id="video" controls></video>
+      <canvas id="canvas"></canvas>
+
+      <button id="analyzeBtn" disabled>Analyze Video</button>
+
+      <div class="output">SpO₂ estimate: <span id="spo2Value">–</span></div>
+      <div class="small">
+        Uses a simple rPPG-style feature extractor on the forehead region, then
+        runs your Tiny Transformer model in the browser.<br />
+        Research demo only – not calibrated for medical use.
+      </div>
+    </div>
+
+    <script>
+      const SEQ_LEN = 200; // must match training MAX_T
+      let session = null;
+      let featMean = null;
+      let featStd = null;
+
+      const statusEl = document.getElementById("status");
+      const videoEl = document.getElementById("video");
+      const canvasEl = document.getElementById("canvas");
+      const ctx = canvasEl.getContext("2d");
+      const videoInput = document.getElementById("videoInput");
+      const analyzeBtn = document.getElementById("analyzeBtn");
+      const spo2Span = document.getElementById("spo2Value");
+
+      // -------- load norm + model --------
+      async function loadNorm() {
+        const res = await fetch("norm.json");
+        if (!res.ok) throw new Error("Failed to load norm.json");
+        const data = await res.json();
+        featMean = data.feat_mean;
+        featStd = data.feat_std;
+        return data;
+      }
+
+      async function loadModel() {
+        session = await ort.InferenceSession.create("model.onnx");
+      }
+
+      async function init() {
+        try {
+          statusEl.textContent = "Loading model and normalization…";
+          await loadNorm();
+          await loadModel();
+          statusEl.textContent = "Ready. Select a face video file.";
+        } catch (err) {
+          console.error(err);
+          statusEl.textContent = "Error: " + err.message;
+        }
+      }
+
+      init();
+
+      // -------- handle video file selection --------
+      videoInput.addEventListener("change", (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const url = URL.createObjectURL(file);
+        videoEl.src = url;
+        statusEl.textContent =
+          "Video loaded. Play if you want, then click Analyze.";
+        analyzeBtn.disabled = false;
+      });
+
+      // -------- simple rPPG-style feature pipeline --------
+      function extractGreenSignal(frames) {
+        const signal = [];
+        for (const img of frames) {
+          const data = img.data;
+          let gSum = 0;
+          let count = 0;
+          for (let i = 0; i < data.length; i += 4) {
+            gSum += data[i + 1]; // green channel
+            count++;
+          }
+          signal.push(gSum / count);
+        }
+        return signal;
+      }
+
+      // crude high-pass / band-pass-ish
+      function bandpass(signal) {
+        const out = [];
+        for (let i = 1; i < signal.length - 1; i++) {
+          out.push(signal[i] - (signal[i - 1] + signal[i + 1]) / 2);
+        }
+        return out;
+      }
+
+      // very simple FFT magnitude (slow but ok for demo)
+      function fftMag(signal) {
+        const N = signal.length;
+        const re = new Array(N).fill(0);
+        const im = new Array(N).fill(0);
+        for (let k = 0; k < N; k++) {
+          for (let n = 0; n < N; n++) {
+            const angle = (2 * Math.PI * k * n) / N;
+            re[k] += signal[n] * Math.cos(angle);
+            im[k] -= signal[n] * Math.sin(angle);
+          }
+        }
+        return re.map((r, i) => Math.sqrt(r * r + im[i] * im[i]));
+      }
+
+      // construct 17 features from a local window of the rPPG signal
+      function make17Features(ppgWindow, fftFull) {
+        const len = ppgWindow.length;
+        if (len === 0) return new Array(17).fill(0);
+        const mean = ppgWindow.reduce((a, b) => a + b, 0) / len;
+        const std = Math.sqrt(
+          ppgWindow.map((x) => (x - mean) ** 2).reduce((a, b) => a + b, 0) / len
+        );
+
+        const maxPPG = Math.max(...ppgWindow);
+        const minPPG = Math.min(...ppgWindow);
+        const range = maxPPG - minPPG || 1;
+
+        const maxF = Math.max(...fftFull);
+        const minF = Math.min(...fftFull);
+        const ratioF = minF === 0 ? 0 : maxF / minF;
+
+        return [
+          mean, // 0
+          std, // 1
+          ppgWindow[len - 1] - ppgWindow[0], // 2
+          maxF, // 3
+          minF, // 4
+          ratioF, // 5
+          fftFull[1] || 0, // 6
+          fftFull[2] || 0, // 7
+          fftFull[3] || 0, // 8
+          fftFull[4] || 0, // 9
+          fftFull[5] || 0, // 10
+          ppgWindow.slice(-5).reduce((a, b) => a + b, 0) / Math.min(5, len), // 11
+          ppgWindow.slice(0, 5).reduce((a, b) => a + b, 0) / Math.min(5, len), // 12
+          maxPPG, // 13
+          minPPG, // 14
+          range, // 15
+          std === 0 ? 0 : mean / std, // 16
+        ];
+      }
+
+      async function analyzeVideo() {
+        if (!session || !featMean) {
+          statusEl.textContent = "Model not ready.";
+          return;
+        }
+        if (!videoEl.duration || isNaN(videoEl.duration)) {
+          statusEl.textContent =
+            "Video not ready yet. Try pressing play once, then click Analyze.";
+          return;
+        }
+
+        analyzeBtn.disabled = true;
+        spo2Span.textContent = "…";
+        statusEl.textContent = "Extracting frames and computing features…";
+
+        // prepare canvas / ROI
+        const W = 200,
+          H = 200;
+        canvasEl.width = W;
+        canvasEl.height = H;
+
+        const frames = [];
+        const duration = videoEl.duration;
+
+        // grab SEQ_LEN evenly spaced frames
+        for (let i = 0; i < SEQ_LEN; i++) {
+          videoEl.currentTime = (i / SEQ_LEN) * duration;
+          await new Promise((resolve) => {
+            videoEl.onseeked = () => resolve();
+          });
+
+          // draw frame to canvas
+          ctx.drawImage(videoEl, 0, 0, W, H);
+          // pick a forehead-like ROI (center-top)
+          const roiX = W * 0.25;
+          const roiY = H * 0.15;
+          const roiW = W * 0.5;
+          const roiH = H * 0.2;
+          const imgData = ctx.getImageData(roiX, roiY, roiW, roiH);
+          frames.push(imgData);
+        }
+
+        // rPPG steps
+        const green = extractGreenSignal(frames);
+        const bp = bandpass(green);
+        const fft = fftMag(bp);
+
+        // build 200x17 feature matrix
+        const features = [];
+        for (let t = 0; t < SEQ_LEN; t++) {
+          const start = Math.max(0, t - 20);
+          const window = bp.slice(start, t + 1);
+          features.push(make17Features(window, fft));
+        }
+
+        // normalize and flatten
+        const F = featMean.length; // should be 17
+        const flat = new Float32Array(SEQ_LEN * F);
+        let k = 0;
+        for (let t = 0; t < SEQ_LEN; t++) {
+          for (let f = 0; f < F; f++) {
+            const x = features[t][f];
+            flat[k++] = (x - featMean[f]) / featStd[f];
+          }
+        }
+
+        statusEl.textContent = "Running ONNX model…";
+
+        try {
+          const inputTensor = new ort.Tensor("float32", flat, [1, SEQ_LEN, F]);
+          const maskTensor = new ort.Tensor("bool", new Uint8Array(SEQ_LEN), [
+            1,
+            SEQ_LEN,
+          ]);
+          const out = await session.run({
+            input: inputTensor,
+            mask: maskTensor,
+          });
+          const spo2 = out.output.data[0];
+          spo2Span.textContent = spo2.toFixed(1) + " %";
+          statusEl.textContent = "Done.";
+        } catch (err) {
+          console.error(err);
+          statusEl.textContent = "Inference error: " + err.message;
+          spo2Span.textContent = "–";
+        } finally {
+          analyzeBtn.disabled = false;
+        }
+      }
+
+      analyzeBtn.addEventListener("click", analyzeVideo);
+    </script>
+  </body>
+</html>

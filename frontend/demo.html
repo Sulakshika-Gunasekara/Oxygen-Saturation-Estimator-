@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SpO₂ Demo from Preprocessed Signals</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        margin: 0;
+        padding: 16px;
+        background: #020617;
+        color: #e5e7eb;
+        display: flex;
+        justify-content: center;
+      }
+      .card {
+        max-width: 520px;
+        width: 100%;
+        background: #020617;
+        border-radius: 16px;
+        padding: 20px;
+        box-shadow: 0 10px 40px rgba(15, 23, 42, 0.8);
+        border: 1px solid #1f2937;
+      }
+      h1 {
+        margin-top: 0;
+        text-align: center;
+        font-size: 1.3rem;
+      }
+      .status {
+        font-size: 0.85rem;
+        color: #9ca3af;
+        margin-bottom: 10px;
+        min-height: 1.2em;
+      }
+      select,
+      button {
+        width: 100%;
+        padding: 10px 12px;
+        margin-top: 10px;
+        border-radius: 999px;
+        border: 1px solid #374151;
+        background: #020617;
+        color: #e5e7eb;
+        font-size: 0.95rem;
+      }
+      button {
+        font-weight: 600;
+        background: linear-gradient(135deg, #22c55e, #14b8a6);
+        border: none;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      .output {
+        margin-top: 16px;
+        font-size: 1rem;
+        text-align: center;
+      }
+      .output span {
+        font-weight: 600;
+      }
+      .small {
+        font-size: 0.8rem;
+        color: #9ca3af;
+        margin-top: 8px;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>SpO₂ Demo from Preprocessed Signals</h1>
+      <div id="status" class="status">Loading model…</div>
+
+      <select id="sampleSelect">
+        <option value="">Loading samples…</option>
+      </select>
+
+      <button id="runBtn" disabled>Run Model on Selected Sample</button>
+
+      <div class="output">
+        True SpO₂: <span id="trueValue">–</span><br />
+        Predicted SpO₂: <span id="predValue">–</span><br />
+        Error (Pred − True): <span id="errValue">–</span>
+      </div>
+
+      <div class="small">
+        Uses preprocessed physiological features from your dataset (.npz) and
+        runs the Tiny Transformer entirely in your browser (no backend). This is
+        a research demo, not a medical device.
+      </div>
+    </div>
+
+    <script>
+      let session = null;
+      let featMean = null;
+      let featStd = null;
+      let samples = [];
+
+      const statusEl = document.getElementById("status");
+      const sampleSelect = document.getElementById("sampleSelect");
+      const runBtn = document.getElementById("runBtn");
+      const trueSpan = document.getElementById("trueValue");
+      const predSpan = document.getElementById("predValue");
+      const errSpan = document.getElementById("errValue");
+
+      async function loadNorm() {
+        const res = await fetch("norm.json");
+        if (!res.ok) throw new Error("Failed to load norm.json");
+        const data = await res.json();
+        featMean = data.feat_mean;
+        featStd = data.feat_std;
+        return data;
+      }
+
+      async function loadSamples() {
+        const res = await fetch("demo_samples.json");
+        if (!res.ok)
+          throw new Error(
+            "demo_samples.json not found. Run create_demo_samples.py first."
+          );
+        const data = await res.json();
+        samples = data.samples || [];
+        sampleSelect.innerHTML = "";
+        if (samples.length === 0) {
+          const opt = document.createElement("option");
+          opt.value = "";
+          opt.textContent = "No samples available";
+          sampleSelect.appendChild(opt);
+          return;
+        }
+        samples.forEach((s, idx) => {
+          const opt = document.createElement("option");
+          opt.value = idx;
+          opt.textContent = `${idx + 1}. ${s.dataset} | ${s.file} | idx ${
+            s.index
+          } | label ${s.label.toFixed(1)}`;
+          sampleSelect.appendChild(opt);
+        });
+      }
+
+      async function loadModel() {
+        session = await ort.InferenceSession.create("model.onnx");
+      }
+
+      async function init() {
+        try {
+          statusEl.textContent = "Loading norm, samples, and model…";
+          await loadNorm();
+          await loadSamples();
+          await loadModel();
+          statusEl.textContent = "Ready. Choose a sample and press Run.";
+          runBtn.disabled = false;
+        } catch (err) {
+          console.error(err);
+          statusEl.textContent = "Error: " + err.message;
+        }
+      }
+
+      function normalizeAndFlatten(features) {
+        // features: [T][F]
+        const T = features.length;
+        const F = featMean.length;
+        const flat = new Float32Array(T * F);
+
+        let k = 0;
+        for (let t = 0; t < T; t++) {
+          const row = features[t];
+          for (let f = 0; f < F; f++) {
+            const x = row && row[f] != null ? row[f] : 0;
+            flat[k++] = (x - featMean[f]) / featStd[f];
+          }
+        }
+        return { flat, T, F };
+      }
+
+      async function runOnSelected() {
+        const idx = parseInt(sampleSelect.value, 10);
+        if (isNaN(idx) || !samples[idx]) {
+          statusEl.textContent = "Select a valid sample first.";
+          return;
+        }
+        const sample = samples[idx];
+        statusEl.textContent = "Running inference…";
+        runBtn.disabled = true;
+
+        try {
+          const { flat, T, F } = normalizeAndFlatten(sample.features);
+          const inputTensor = new ort.Tensor("float32", flat, [1, T, F]);
+
+          const maskData = new Uint8Array(T); // all zeros = all valid
+          const maskTensor = new ort.Tensor("bool", maskData, [1, T]);
+
+          const results = await session.run({
+            input: inputTensor,
+            mask: maskTensor,
+          });
+          const pred = results.output.data[0];
+
+          trueSpan.textContent = sample.label.toFixed(1) + " %";
+          predSpan.textContent = pred.toFixed(2) + " %";
+          const err = pred - sample.label;
+          errSpan.textContent = (err >= 0 ? "+" : "") + err.toFixed(2) + " %";
+
+          statusEl.textContent = "Done.";
+        } catch (err) {
+          console.error(err);
+          statusEl.textContent = "Inference error: " + err.message;
+        } finally {
+          runBtn.disabled = false;
+        }
+      }
+
+      runBtn.addEventListener("click", runOnSelected);
+      init();
+    </script>
+  </body>
+</html>
